@@ -6,9 +6,10 @@
 //
 
 import UIKit
+import WebKit
 
 /// RichEditorDelegate defines callbacks for the delegate of the RichEditorView
-@objc public protocol RichEditorDelegate: class {
+@objc public protocol RichEditorDelegate: AnyObject {
 
     /// Called when the inner height of the text being displayed changes
     /// Can be used to update the UI
@@ -37,7 +38,7 @@ import UIKit
 }
 
 /// RichEditorView is a UIView that displays richly styled text, and allows it to be edited in a WYSIWYG fashion.
-@objcMembers open class RichEditorView: UIView, UIScrollViewDelegate, UIWebViewDelegate, UIGestureRecognizerDelegate {
+@objcMembers open class RichEditorView: UIView, UIScrollViewDelegate, WKNavigationDelegate, UIGestureRecognizerDelegate {
 
     // MARK: Public Properties
 
@@ -47,12 +48,12 @@ import UIKit
     /// Input accessory view to display over they keyboard.
     /// Defaults to nil
     open override var inputAccessoryView: UIView? {
-        get { return webView.cjw_inputAccessoryView }
-        set { webView.cjw_inputAccessoryView = newValue }
+        get { return webView.accessoryView }
+        set { webView.accessoryView = newValue }
     }
 
     /// The internal UIWebView that is used to display the text.
-    open private(set) var webView: UIWebView
+    open private(set) var webView: RichWebView
 
     /// Whether or not scroll is enabled on the view.
     open var isScrollEnabled: Bool = true {
@@ -123,13 +124,17 @@ import UIKit
     // MARK: Initialization
     
     public override init(frame: CGRect) {
-        webView = UIWebView()
+        let configuration = WKWebViewConfiguration()
+        configuration.dataDetectorTypes = WKDataDetectorTypes()
+        webView = RichWebView(frame: .zero, configuration: configuration)
         super.init(frame: frame)
         setup()
     }
 
     required public init?(coder aDecoder: NSCoder) {
-        webView = UIWebView()
+        let configuration = WKWebViewConfiguration()
+        configuration.dataDetectorTypes = WKDataDetectorTypes()
+        webView = RichWebView(frame: .zero, configuration: configuration)
         super.init(coder: aDecoder)
         setup()
     }
@@ -138,26 +143,21 @@ import UIKit
         backgroundColor = .red
         
         webView.frame = bounds
-        webView.delegate = self
-        webView.keyboardDisplayRequiresUserAction = false
-        webView.scalesPageToFit = false
+        webView.navigationDelegate = self
         webView.autoresizingMask = [.flexibleWidth, .flexibleHeight]
-        webView.dataDetectorTypes = UIDataDetectorTypes()
         webView.backgroundColor = .white
         
         webView.scrollView.isScrollEnabled = isScrollEnabled
         webView.scrollView.bounces = false
         webView.scrollView.delegate = self
         webView.scrollView.clipsToBounds = false
-        
-        webView.cjw_inputAccessoryView = nil
-        
+                
         self.addSubview(webView)
         
         if let filePath = Bundle(for: RichEditorView.self).path(forResource: "rich_editor", ofType: "html") {
             let url = URL(fileURLWithPath: filePath, isDirectory: false)
             let request = URLRequest(url: url)
-            webView.loadRequest(request)
+            webView.load(request)
         }
 
         tapRecognizer.addTarget(self, action: #selector(viewWasTapped))
@@ -346,10 +346,22 @@ import UIKit
     /// If there is no result, returns an empty string
     /// - parameter js: The JavaScript string to be run
     /// - returns: The result of the JavaScript that was run
+    public func runJS(_ js: String, completion: ((Any?) -> Void)? = nil) {
+        webView.evaluateJavaScript(js) { value, error in
+            completion?(value)
+        }
+    }
+    
     @discardableResult
     public func runJS(_ js: String) -> String {
-        let string = webView.stringByEvaluatingJavaScript(from: js) ?? ""
-        return string
+        let semaphore = DispatchSemaphore(value: 1)
+        var result: String?
+        webView.evaluateJavaScript(js) { value, error in
+            result = value as? String
+            semaphore.signal()
+        }
+        semaphore.wait()
+        return result ?? ""
     }
 
 
@@ -366,45 +378,54 @@ import UIKit
     }
 
 
-    // MARK: UIWebViewDelegate
-
-    public func webView(_ webView: UIWebView, shouldStartLoadWith request: URLRequest, navigationType: UIWebViewNavigationType) -> Bool {
-
+    // MARK: WKNavigationDelegate
+    
+    public func webView(_ webView: WKWebView, decidePolicyFor navigationAction: WKNavigationAction, decisionHandler: @escaping (WKNavigationActionPolicy) -> Void) {
+        let request = navigationAction.request
+        
         // Handle pre-defined editor actions
         let callbackPrefix = "re-callback://"
         if request.url?.absoluteString.hasPrefix(callbackPrefix) == true {
             
             // When we get a callback, we need to fetch the command queue to run the commands
             // It comes in as a JSON array of commands that we need to parse
-            let commands = runJS("RE.getCommandQueue();")
-
-            if let data = commands.data(using: .utf8) {
+            runJS("RE.getCommandQueue();") { [weak self] commands in
+                guard let self = self else { return }
                 
-                let jsonCommands: [String]
-                do {
-                    jsonCommands = try JSONSerialization.jsonObject(with: data) as? [String] ?? []
-                } catch {
-                    jsonCommands = []
-                    NSLog("RichEditorView: Failed to parse JSON Commands")
+                var data: Data?
+                if let commandsData = commands as? Data {
+                    data = commandsData
+                } else if let commandsString = commands as? String {
+                    data = commandsString.data(using: .utf8)
                 }
 
-                jsonCommands.forEach(performCommand)
+                if let data = data {
+                    let jsonCommands: [String]
+                    do {
+                        jsonCommands = try JSONSerialization.jsonObject(with: data) as? [String] ?? []
+                    } catch {
+                        jsonCommands = []
+                        NSLog("RichEditorView: Failed to parse JSON Commands")
+                    }
+
+                    jsonCommands.forEach(self.performCommand)
+                }
             }
 
-            return false
+            return decisionHandler(.cancel)
         }
         
         // User is tapping on a link, so we should react accordingly
-        if navigationType == .linkClicked {
+        if navigationAction.navigationType == .linkActivated {
             if let
                 url = request.url,
                 let shouldInteract = delegate?.richEditor?(self, shouldInteractWith: url)
             {
-                return shouldInteract
+                return decisionHandler(shouldInteract ? .allow : .cancel)
             }
         }
         
-        return true
+        return decisionHandler(.allow)
     }
 
 
@@ -503,9 +524,10 @@ import UIKit
         }
         else if method.hasPrefix("input") {
             scrollCaretToVisible()
-            let content = runJS("RE.getHtml()")
-            contentHTML = content
-            updateHeight()
+            runJS("RE.getHtml()") { [weak self] result in
+                self?.contentHTML = (result as? String) ?? ""
+                self?.updateHeight()
+            }
         }
         else if method.hasPrefix("updateHeight") {
             updateHeight()
@@ -517,8 +539,9 @@ import UIKit
             delegate?.richEditorLostFocus?(self)
         }
         else if method.hasPrefix("action/") {
-            let content = runJS("RE.getHtml()")
-            contentHTML = content
+            runJS("RE.getHtml()") { [weak self] result in
+                self?.contentHTML = (result as? String) ?? ""
+            }
             
             // If there are any custom actions being called
             // We need to tell the delegate about it
